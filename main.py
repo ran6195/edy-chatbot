@@ -54,6 +54,10 @@ def _log_query(site_domain: str, question: str, answer: str) -> None:
     threading.Thread(target=_insert, daemon=True).start()
 
 
+def _normalize_domain(domain: str) -> str:
+    return domain.removeprefix("www.")
+
+
 def _fetch_context(site_domain: str) -> str:
     table_ref = f"`{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}`"
     query = f"""
@@ -83,7 +87,7 @@ def chatbot(request):
         data = request.get_json(silent=True) or {}
 
         question = (data.get("question") or "").strip()
-        site_domain = (data.get("site_domain") or "").strip()
+        site_domain = _normalize_domain((data.get("site_domain") or "").strip())
 
         if not question:
             return _cors_response(400, {"error": "Il campo 'question' è obbligatorio."})

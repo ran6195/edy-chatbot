@@ -121,9 +121,13 @@ def clear_domain(domain: str) -> None:
     logger.info("Record esistenti eliminati per %s", domain)
 
 
+def _normalize_domain(domain: str) -> str:
+    return domain.removeprefix("www.")
+
+
 def crawl_site(base_url: str, max_pages: int, priority_urls: list[str]) -> list[dict]:
     """Crawla il sito rispettando la priorità degli URL indicati."""
-    domain = urllib.parse.urlparse(base_url).netloc
+    domain = _normalize_domain(urllib.parse.urlparse(base_url).netloc)
     rp = _robots_allowed(base_url)
 
     # Le URL prioritarie vanno in testa alla coda, poi la home
