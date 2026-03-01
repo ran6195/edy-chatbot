@@ -72,13 +72,56 @@ def _chunk_text(text: str, size: int) -> list[str]:
     return chunks
 
 
+# Tag da rimuovere prima dell'estrazione del testo
+_NOISE_TAGS = [
+    "nav", "footer", "header", "aside", "script", "style",
+    "noscript", "form", "button", "iframe", "svg", "img",
+    "figure", "figcaption", "meta", "link",
+]
+
+# Classi/id che tipicamente contengono rumore
+_NOISE_SELECTORS = [
+    "[class*='cookie']", "[class*='banner']", "[class*='popup']",
+    "[class*='modal']", "[id*='cookie']", "[id*='banner']",
+    "[class*='breadcrumb']", "[class*='pagination']",
+    "[class*='sidebar']", "[class*='widget']",
+]
+
+
+def _extract_title(soup: BeautifulSoup) -> str:
+    """Restituisce il titolo della pagina (h1 o tag title)."""
+    h1 = soup.find("h1")
+    if h1:
+        return h1.get_text(strip=True)
+    title = soup.find("title")
+    if title:
+        return title.get_text(strip=True).split("|")[0].strip()
+    return ""
+
+
 def _extract_text(soup: BeautifulSoup) -> str:
-    tags = soup.find_all(["h1", "h2", "h3", "p", "li"])
+    """Rimuove elementi di rumore ed estrae il testo rilevante."""
+    # Lavora su una copia per non alterare il soup originale
+    import copy
+    soup = copy.copy(soup)
+
+    # Rimuovi tag rumorosi
+    for tag in soup.find_all(_NOISE_TAGS):
+        tag.decompose()
+
+    # Rimuovi elementi per classe/id
+    for selector in _NOISE_SELECTORS:
+        for el in soup.select(selector):
+            el.decompose()
+
+    tags = soup.find_all(["h1", "h2", "h3", "h4", "p", "li", "td", "th"])
     parts = []
+    seen = set()
     for tag in tags:
         text = tag.get_text(separator=" ", strip=True)
-        if len(text) > 30:
+        if len(text) > 30 and text not in seen:
             parts.append(text)
+            seen.add(text)
     return "\n".join(parts)
 
 
@@ -158,15 +201,17 @@ def crawl_site(base_url: str, max_pages: int, priority_urls: list[str]) -> list[
             logger.info("[%s] (%d/%d) %s", domain, len(visited), max_pages, url)
 
             soup = BeautifulSoup(resp.text, "html.parser")
+            title = _extract_title(soup)
             text = _extract_text(soup)
 
             if text.strip():
+                prefix = f"[Pagina: {title} | {url}]\n" if title else f"[Pagina: {url}]\n"
                 for chunk in _chunk_text(text, CHUNK_SIZE):
                     chunk_id = hashlib.md5(f"{url}:{chunk}".encode()).hexdigest()
                     records.append({
                         "id": chunk_id,
                         "site_domain": domain,
-                        "content": chunk,
+                        "content": prefix + chunk,
                         "page_url": url,
                         "indexed_at": datetime.now(timezone.utc).isoformat(),
                     })
