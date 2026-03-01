@@ -1,0 +1,14 @@
+.gcloudignore
+.git
+.gitignore
+.env
+.env.example
+*.md
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+scraper.py
+requirements-scraper.txt
+setup.sh
+chatbot-widget.js
