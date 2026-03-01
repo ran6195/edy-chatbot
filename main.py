@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -58,21 +59,46 @@ def _normalize_domain(domain: str) -> str:
     return domain.removeprefix("www.")
 
 
-def _fetch_context(site_domain: str) -> str:
+def _fetch_context(site_domain: str, question: str) -> str:
     table_ref = f"`{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}`"
-    query = f"""
-        SELECT content, page_url
-        FROM {table_ref}
-        WHERE site_domain = @site_domain
-        ORDER BY indexed_at DESC
-        LIMIT 5
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("site_domain", "STRING", site_domain)
-        ]
-    )
-    rows = bq_client.query(query, job_config=job_config).result()
+
+    # Rimuove caratteri riservati da BigQuery SEARCH, poi filtra parole > 2 caratteri
+    clean = re.sub(r"[^\w\s]", " ", question, flags=re.UNICODE)
+    search_terms = " ".join(w for w in clean.split() if len(w) > 2)
+
+    rows = []
+    if search_terms:
+        query = f"""
+            SELECT content, page_url
+            FROM {table_ref}
+            WHERE site_domain = @site_domain
+              AND SEARCH(content, @search_query)
+            LIMIT 15
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("site_domain", "STRING", site_domain),
+                bigquery.ScalarQueryParameter("search_query", "STRING", search_terms),
+            ]
+        )
+        rows = list(bq_client.query(query, job_config=job_config).result())
+
+    # Fallback: se la ricerca full-text non trova nulla, usa i chunk più recenti
+    if not rows:
+        query = f"""
+            SELECT content, page_url
+            FROM {table_ref}
+            WHERE site_domain = @site_domain
+            ORDER BY indexed_at DESC
+            LIMIT 10
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("site_domain", "STRING", site_domain),
+            ]
+        )
+        rows = list(bq_client.query(query, job_config=job_config).result())
+
     chunks = [f"[{row.page_url}]\n{row.content}" for row in rows]
     return "\n\n---\n\n".join(chunks)
 
@@ -94,7 +120,7 @@ def chatbot(request):
         if not site_domain:
             return _cors_response(400, {"error": "Il campo 'site_domain' è obbligatorio."})
 
-        context = _fetch_context(site_domain)
+        context = _fetch_context(site_domain, question)
 
         if context:
             system_prompt = (
