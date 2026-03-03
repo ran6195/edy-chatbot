@@ -26,8 +26,10 @@ import urllib.robotparser
 from datetime import datetime, timezone
 
 import requests
+import vertexai
 from bs4 import BeautifulSoup
 from google.cloud import bigquery
+from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,6 +54,19 @@ CRAWL_DELAY = 1.0
 HEADERS = {
     "User-Agent": "ChatbotScraper/1.0 (educational project; contact: info@example.com)"
 }
+
+EMBED_MODEL = "text-multilingual-embedding-002"
+EMBED_BATCH = 50
+_embedding_model = None
+
+
+def _get_embeddings(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
+    global _embedding_model
+    if _embedding_model is None:
+        vertexai.init(project=GCP_PROJECT_ID, location="europe-west4")
+        _embedding_model = TextEmbeddingModel.from_pretrained(EMBED_MODEL)
+    inputs = [TextEmbeddingInput(t, task_type=task_type) for t in texts]
+    return [e.values for e in _embedding_model.get_embeddings(inputs)]
 
 # ── BigQuery ──────────────────────────────────────────────────────────────────
 bq_client = bigquery.Client(project=GCP_PROJECT_ID)
@@ -235,20 +250,53 @@ def crawl_site(base_url: str, max_pages: int, priority_urls: list[str]) -> list[
     return records
 
 
+def _add_embeddings(records: list[dict]) -> None:
+    """Aggiunge embedding a ogni record (in-place), a batch di EMBED_BATCH."""
+    texts = [r["content"] for r in records]
+    for i in range(0, len(records), EMBED_BATCH):
+        batch_records = records[i:i + EMBED_BATCH]
+        batch_texts = texts[i:i + EMBED_BATCH]
+        try:
+            vectors = _get_embeddings(batch_texts)
+            for rec, vec in zip(batch_records, vectors):
+                rec["embedding"] = vec
+        except Exception as e:
+            logger.warning("Errore embedding batch %d: %s — chunk senza embedding", i // EMBED_BATCH, e)
+
+
+_BQ_SCHEMA = [
+    bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("site_domain", "STRING", mode="REQUIRED"),
+    bigquery.SchemaField("content", "STRING"),
+    bigquery.SchemaField("page_url", "STRING"),
+    bigquery.SchemaField("indexed_at", "TIMESTAMP"),
+    bigquery.SchemaField("embedding", "FLOAT64", mode="REPEATED"),
+]
+
+
 def upload_to_bigquery(records: list[dict]) -> None:
     if not records:
         logger.info("Nessun record da caricare.")
         return
 
-    # Inserisce in batch da 500 righe
-    batch_size = 500
-    for i in range(0, len(records), batch_size):
-        batch = records[i:i + batch_size]
-        errors = bq_client.insert_rows_json(TABLE_REF, batch)
-        if errors:
-            logger.error("Errori BigQuery nel batch %d: %s", i // batch_size, errors)
-            raise RuntimeError("Inserimento fallito")
+    logger.info("Generazione embeddings per %d chunk...", len(records))
+    _add_embeddings(records)
 
+    # Load job (non streaming) → nessun buffer, DELETE immediato possibile
+    import io
+    import json as _json
+    data = "\n".join(_json.dumps(r) for r in records)
+    job_config = bigquery.LoadJobConfig(
+        schema=_BQ_SCHEMA,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+    )
+    job = bq_client.load_table_from_file(
+        io.BytesIO(data.encode()),
+        TABLE_REF,
+        job_config=job_config,
+    )
+    job.result()
     logger.info("Caricati %d record in %s", len(records), TABLE_REF)
 
 

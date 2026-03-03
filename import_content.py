@@ -20,7 +20,9 @@ import os
 import sys
 from datetime import datetime, timezone
 
+import vertexai
 from google.cloud import bigquery
+from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -29,9 +31,22 @@ GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
 BQ_DATASET = os.environ.get("BQ_DATASET", "chatbot")
 BQ_TABLE = os.environ.get("BQ_TABLE", "website_content")
 CHUNK_SIZE = 500
+EMBED_MODEL = "text-multilingual-embedding-002"
+EMBED_BATCH = 50
 
 bq_client = bigquery.Client(project=GCP_PROJECT_ID)
 TABLE_REF = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}"
+
+_embedding_model = None
+
+
+def _get_embeddings(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
+    global _embedding_model
+    if _embedding_model is None:
+        vertexai.init(project=GCP_PROJECT_ID, location="europe-west4")
+        _embedding_model = TextEmbeddingModel.from_pretrained(EMBED_MODEL)
+    inputs = [TextEmbeddingInput(t, task_type=task_type) for t in texts]
+    return [e.values for e in _embedding_model.get_embeddings(inputs)]
 
 
 def _chunk_text(text: str, size: int) -> list[str]:
@@ -78,11 +93,40 @@ def import_file(domain: str, filepath: str, url: str) -> None:
             "indexed_at": now,
         })
 
-    errors = bq_client.insert_rows_json(TABLE_REF, records)
-    if errors:
-        logger.error("Errori BigQuery: %s", errors)
-        sys.exit(1)
+    logger.info("Generazione embeddings per %d chunk...", len(records))
+    texts = [r["content"] for r in records]
+    for i in range(0, len(records), EMBED_BATCH):
+        batch_records = records[i:i + EMBED_BATCH]
+        batch_texts = texts[i:i + EMBED_BATCH]
+        try:
+            vectors = _get_embeddings(batch_texts)
+            for rec, vec in zip(batch_records, vectors):
+                rec["embedding"] = vec
+        except Exception as e:
+            logger.warning("Errore embedding batch %d: %s — chunk senza embedding", i // EMBED_BATCH, e)
 
+    import io
+    import json as _json
+    schema = [
+        bigquery.SchemaField("id", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("site_domain", "STRING", mode="REQUIRED"),
+        bigquery.SchemaField("content", "STRING"),
+        bigquery.SchemaField("page_url", "STRING"),
+        bigquery.SchemaField("indexed_at", "TIMESTAMP"),
+        bigquery.SchemaField("embedding", "FLOAT64", mode="REPEATED"),
+    ]
+    data = "\n".join(_json.dumps(r) for r in records)
+    job_config = bigquery.LoadJobConfig(
+        schema=schema,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+    )
+    job = bq_client.load_table_from_file(
+        io.BytesIO(data.encode()),
+        TABLE_REF,
+        job_config=job_config,
+    )
+    job.result()
     logger.info("Importati %d chunk per %s da '%s'", len(records), domain, filepath)
 
 

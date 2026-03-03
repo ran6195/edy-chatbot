@@ -19,6 +19,7 @@ gcloud services enable \
   cloudbuild.googleapis.com \
   logging.googleapis.com \
   secretmanager.googleapis.com \
+  aiplatform.googleapis.com \
   --project="$PROJECT_ID"
 
 # ── 2. BigQuery dataset e tabella ────────────────────────────────────────────
@@ -32,8 +33,29 @@ CREATE TABLE IF NOT EXISTS \`$PROJECT_ID.$BQ_DATASET.$BQ_TABLE\` (
   site_domain STRING NOT NULL,
   content STRING,
   page_url STRING,
-  indexed_at TIMESTAMP
+  indexed_at TIMESTAMP,
+  embedding ARRAY<FLOAT64>
 );"
+
+echo "==> Aggiunta colonna embedding (se non esiste)..."
+bq --project_id="$PROJECT_ID" query --nouse_legacy_sql "
+ALTER TABLE \`$PROJECT_ID.$BQ_DATASET.$BQ_TABLE\`
+ADD COLUMN IF NOT EXISTS embedding ARRAY<FLOAT64>;"
+
+echo "==> Creazione Vector Index (richiede ≥500 righe)..."
+bq --project_id="$PROJECT_ID" query --nouse_legacy_sql "
+CREATE VECTOR INDEX IF NOT EXISTS idx_embedding
+ON \`$PROJECT_ID.$BQ_DATASET.$BQ_TABLE\`(embedding)
+OPTIONS(distance_type='COSINE', index_type='IVF');" || echo "Vector Index: verrà creato automaticamente quando la tabella avrà ≥500 righe."
+
+# ── 2b. Ruolo Vertex AI per il Service Account runtime ────────────────────────
+echo "==> Assegnazione ruolo Vertex AI al Service Account Compute..."
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$COMPUTE_SA" \
+  --role="roles/aiplatform.user" \
+  --project="$PROJECT_ID"
 
 # ── 3. Secret Manager — API key Anthropic ────────────────────────────────────
 echo "==> Caricamento ANTHROPIC_API_KEY in Secret Manager..."
